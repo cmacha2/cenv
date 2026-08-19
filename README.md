@@ -55,6 +55,7 @@ then `claude login` (credentials never sync, by design).
 | `cenv doctor [--quiet]` | Verify capture wiring; `--quiet` prints only problems (runs at every session start) |
 | `cenv export [FILE...]` | Export the current project's sessions (or specific `.jsonl` files) to Markdown |
 | `cenv export --reindex` | Rebuild the project index from export frontmatter |
+| `cenv analyze [--all] [--limit N]` | Summarize and distill sessions whose SessionEnd hook never finished |
 | `cenv adopt [--central]` | Keep this project's history in `<project>/history/` instead of the central store |
 | `cenv distill apply [--path DIR] [--global --confirm]` | Apply checked `[x]` rule candidates into the matching CLAUDE.md |
 | `cenv distill scan-global` | Cluster candidates across projects; recurring ones become global candidates |
@@ -123,6 +124,21 @@ staging — and fixing what a code review of it surfaced:
   `enable-hooks` writes the resolved path of the binary you ran, re-running
   repairs a stale path in place, and `doctor` reports a hook command the hook
   shell could not resolve.
+- **The summary survives a cancelled hook.** SessionEnd is the one hook that may
+  call a model, and the host can cancel it mid-call (headless runs do this every
+  time). The work is never lost: `cenv analyze` runs the pass for any session the
+  hook did not finish, and a new session mentions the backlog instead of blocking
+  on it.
+
+### Debugging
+
+Hooks stay silent so they can never break a session, which also hides genuine
+problems. `CENV_DEBUG=1` makes them narrate what they decided and why:
+
+```bash
+CENV_DEBUG=1 claude    # hook decisions appear on stderr
+cenv doctor            # or check the wiring directly
+```
 - **Your own config survives.** `enable-hooks` merges into `settings.json`
   instead of replacing it, backs it up first, writes atomically, removes only
   the exact commands cenv itself wrote, and — if `install` ever displaces a

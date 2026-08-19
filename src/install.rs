@@ -60,12 +60,25 @@ fn is_our_command(command: &str, event_cmd: &str) -> bool {
     prefix.ends_with("cenv") || prefix.ends_with("cenv.exe")
 }
 
+/// The hook entry for an event. SessionEnd asks for a longer timeout and shows a
+/// status message, because that is the one hook that may call a model: the
+/// default timeout is well under what a summary can take, and without this the
+/// host cancels the hook mid-call.
+fn hook_entry(event: &str, event_cmd: &str) -> Value {
+    let mut entry = json!({ "type": "command", "command": hook_command(event_cmd) });
+    if event == "SessionEnd" {
+        entry["timeout"] = json!(150);
+        entry["statusMessage"] = json!("Summarizing session");
+    }
+    entry
+}
+
 fn hooks_value() -> Value {
     let mut hooks = serde_json::Map::new();
     for (event, event_cmd) in HOOK_EVENTS {
         hooks.insert(
             event.to_string(),
-            json!([{ "hooks": [{ "type": "command", "command": hook_command(event_cmd) }] }]),
+            json!([{ "hooks": [hook_entry(event, event_cmd)] }]),
         );
     }
     Value::Object(hooks)
@@ -171,9 +184,7 @@ pub fn enable_hooks(remove: bool) -> Result<()> {
         });
 
         if !remove {
-            arr.push(json!({
-                "hooks": [{ "type": "command", "command": hook_command(event_cmd) }]
-            }));
+            arr.push(json!({ "hooks": [hook_entry(event, event_cmd)] }));
         }
     }
 

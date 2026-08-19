@@ -39,6 +39,25 @@ pub fn save_session(session_id: &str, st: &SessionState) -> Result<()> {
     write_atomic(&path, &serde_json::to_vec_pretty(st)?)
 }
 
+/// Every tracked session, as (session id, state), newest transcript first.
+/// The id is recovered from the state itself so a slugified filename can never
+/// desynchronize from it.
+pub fn all_sessions() -> Vec<(String, SessionState)> {
+    let mut out: Vec<(String, SessionState)> = fs::read_dir(paths::state_dir().join("sessions"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                .filter_map(|e| fs::read_to_string(e.path()).ok())
+                .filter_map(|raw| serde_json::from_str::<SessionState>(&raw).ok())
+                .filter_map(|st| st.meta.session.clone().map(|id| (id, st)))
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort_by(|a, b| b.1.meta.updated.cmp(&a.1.meta.updated));
+    out
+}
+
 /// Write via temp file + rename, so a reader never sees a half-written file and
 /// an interrupted write leaves the previous contents intact.
 ///

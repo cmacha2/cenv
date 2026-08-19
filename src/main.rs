@@ -70,6 +70,15 @@ enum Cmd {
         #[arg(long, requires = "reindex")]
         store: Option<PathBuf>,
     },
+    /// Summarize and distill sessions whose SessionEnd hook never finished
+    Analyze {
+        /// Every project, not just this one
+        #[arg(long)]
+        all: bool,
+        /// Stop after this many sessions
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Keep this project's history inside the repo (<project>/history/) instead of the central store
     Adopt {
         /// Revert to the central store
@@ -185,6 +194,12 @@ fn main() -> Result<()> {
                     None => println!("skip (empty): {}", t.display()),
                 }
             }
+        }
+        Cmd::Analyze { all, limit } => {
+            let cwd = std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned());
+            hook::analyze_pending(limit, if all { None } else { cwd.as_deref() })?;
         }
         Cmd::Adopt { central } => {
             let cwd = std::env::current_dir()?;
