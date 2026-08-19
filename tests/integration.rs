@@ -403,11 +403,95 @@ fn doctor_accepts_hooks_in_settings_local() {
         "should complain: {out}"
     );
 
+    let bin = env!("CARGO_BIN_EXE_cenv");
     fs::write(
         sb.path("claude/settings.local.json"),
-        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cenv hook stop"}]}]}}"#,
+        format!(
+            r#"{{"hooks":{{"Stop":[{{"hooks":[{{"type":"command","command":"{bin} hook stop"}}]}}]}}}}"#
+        ),
     )
     .unwrap();
     let (ok, out) = sb.cenv(&["doctor", "--quiet"], None);
     assert!(ok && out.is_empty(), "should be satisfied: {out}");
+}
+
+#[test]
+fn hooks_are_wired_with_a_resolvable_absolute_path() {
+    // The bug this pins: hooks run under a non-interactive `/bin/sh` that
+    // sources no shell profile, so a bare `cenv` is not on PATH and every stop
+    // fails with "command not found" — capture silently never happens.
+    let sb = Sandbox::new();
+    let (ok, _) = sb.cenv(&["enable-hooks"], None);
+    assert!(ok);
+
+    let settings: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(sb.path("claude/settings.json")).unwrap())
+            .unwrap();
+    let cmd = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let bin = cmd.trim_end_matches(" hook stop").trim_matches('"');
+    assert!(
+        Path::new(bin).is_absolute() && Path::new(bin).is_file(),
+        "hook must name an existing absolute binary, got: {cmd}"
+    );
+
+    // And it must actually run under a bare-PATH `sh`, the way a hook does.
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("{cmd} < /dev/null"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("CENV_DATA_DIR", sb.path("data"))
+        .env("CENV_STATE_DIR", sb.path("state"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("not found"),
+        "hook command must resolve under a bare PATH: {stderr}"
+    );
+    assert!(out.status.success(), "hook must exit 0: {stderr}");
+
+    // Doctor flags a bare command that the hook shell could not resolve.
+    fs::write(
+        sb.path("claude/settings.json"),
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cenv hook stop"}]}]}}"#,
+    )
+    .unwrap();
+    let (ok, out) = sb.cenv(&["doctor", "--quiet"], None);
+    assert!(
+        !ok && out.contains("won't resolve in the hook shell"),
+        "doctor should catch a bare command: {out}"
+    );
+}
+
+#[test]
+fn enable_hooks_replaces_a_stale_binary_path() {
+    let sb = Sandbox::new();
+    fs::write(
+        sb.path("claude/settings.json"),
+        r#"{"hooks":{"Stop":[{"hooks":[
+             {"type":"command","command":"/old/prefix/cenv hook stop"},
+             {"type":"command","command":"cenv hook stop && notify-me"}
+           ]}]}}"#,
+    )
+    .unwrap();
+    let (ok, _) = sb.cenv(&["enable-hooks"], None);
+    assert!(ok);
+
+    let content = fs::read_to_string(sb.path("claude/settings.json")).unwrap();
+    assert!(
+        !content.contains("/old/prefix/cenv"),
+        "stale path must be replaced, not stacked:\n{content}"
+    );
+    assert!(
+        content.contains("cenv hook stop && notify-me"),
+        "a user's own wrapper must survive:\n{content}"
+    );
+    assert_eq!(
+        content.matches("hook stop").count(),
+        2,
+        "exactly our new entry plus the user's wrapper:\n{content}"
+    );
 }

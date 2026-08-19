@@ -31,19 +31,90 @@ fn settings_candidates() -> Vec<std::path::PathBuf> {
     v
 }
 
+/// Every `cenv hook …` command string found across the active settings files.
+fn configured_hook_commands() -> Vec<String> {
+    let mut out = Vec::new();
+    for path in settings_candidates() {
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let Some(events) = json.get("hooks").and_then(|h| h.as_object()) else {
+            continue;
+        };
+        for groups in events.values() {
+            for g in groups.as_array().into_iter().flatten() {
+                for h in g
+                    .get("hooks")
+                    .and_then(|x| x.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(cmd) = h.get("command").and_then(|c| c.as_str())
+                        && cmd.contains("cenv hook")
+                    {
+                        out.push(cmd.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The executable a hook command will actually try to run.
+fn hook_binary(command: &str) -> String {
+    let c = command.trim();
+    if let Some(rest) = c.strip_prefix('"') {
+        return rest.split('"').next().unwrap_or(rest).to_string();
+    }
+    c.split_whitespace().next().unwrap_or(c).to_string()
+}
+
+fn resolvable(bin: &str) -> bool {
+    if bin.contains('/') {
+        return Path::new(bin).is_file();
+    }
+    // A bare name depends on PATH — and hooks run under a non-interactive shell
+    // that sources no profile, so PATH there is the bare system default.
+    [
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/opt/homebrew/bin",
+        "/usr/sbin",
+        "/sbin",
+    ]
+    .iter()
+    .any(|d| Path::new(d).join(bin).is_file())
+}
+
 pub fn problems() -> Vec<String> {
     let mut out = Vec::new();
     let settings = paths::claude_dir().join("settings.json");
 
-    let hooks_live = settings_candidates()
-        .iter()
-        .filter_map(|p| fs::read_to_string(p).ok())
-        .any(|c| c.contains("cenv hook"));
-    if !hooks_live {
+    let commands = configured_hook_commands();
+    if commands.is_empty() {
         out.push(format!(
             "no cenv hooks in any active settings file (checked {}) — sessions are NOT being captured; run `cenv enable-hooks`",
             settings.display()
         ));
+    }
+    // A hook whose binary the hook shell cannot find fails with "command not
+    // found" on every stop — visible only as a hook error, never as missing
+    // history, so it is worth naming explicitly.
+    for cmd in &commands {
+        let bin = hook_binary(cmd);
+        if !resolvable(&bin) {
+            out.push(format!(
+                "hook command points at `{bin}`, which won't resolve in the hook shell \
+                 (it starts with no shell profile, so ~/.cargo/bin is not on PATH) — \
+                 re-run `cenv enable-hooks` to wire the absolute path"
+            ));
+            break;
+        }
     }
 
     if let Ok(target) = fs::read_link(&settings) {

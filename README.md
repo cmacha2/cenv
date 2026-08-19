@@ -117,6 +117,12 @@ staging — and fixing what a code review of it surfaced:
 - **Schema drift fails loudly, not silently.** Transcript parsing is
   defaults-and-heuristics (no single undocumented field decides what a "typed
   user turn" is), and the behavior is pinned by tests.
+- **Hooks are wired with an absolute path.** Hook commands run under a
+  non-interactive shell that sources no profile, so `~/.cargo/bin` is not on its
+  PATH and a bare `cenv` would fail with "command not found" on every stop.
+  `enable-hooks` writes the resolved path of the binary you ran, re-running
+  repairs a stale path in place, and `doctor` reports a hook command the hook
+  shell could not resolve.
 - **Your own config survives.** `enable-hooks` merges into `settings.json`
   instead of replacing it, backs it up first, writes atomically, removes only
   the exact commands cenv itself wrote, and — if `install` ever displaces a

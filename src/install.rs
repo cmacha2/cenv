@@ -15,18 +15,57 @@ use serde_json::{Value, json};
 
 use crate::paths;
 
+/// (settings.json event, `cenv hook` subcommand)
 const HOOK_EVENTS: [(&str, &str); 3] = [
-    ("SessionStart", "cenv hook session-start"),
-    ("Stop", "cenv hook stop"),
-    ("SessionEnd", "cenv hook session-end"),
+    ("SessionStart", "session-start"),
+    ("Stop", "stop"),
+    ("SessionEnd", "session-end"),
 ];
+
+/// Absolute path to the running binary. Hooks execute under a non-interactive
+/// `/bin/sh`, which sources no shell profile, so `~/.cargo/bin` (or any other
+/// install prefix) is simply not on PATH there — a bare `cenv` command fails
+/// with "command not found" and capture silently never happens. Wiring the
+/// resolved path of whatever binary the user just ran removes the assumption.
+fn binary_path() -> PathBuf {
+    std::env::current_exe()
+        .map(|p| fs::canonicalize(&p).unwrap_or(p))
+        .unwrap_or_else(|_| PathBuf::from("cenv"))
+}
+
+fn hook_command(event_cmd: &str) -> String {
+    let bin = binary_path();
+    let bin = bin.to_string_lossy();
+    // Quote only when needed, so the common case stays readable in settings.json.
+    if bin.contains(char::is_whitespace) {
+        format!("\"{bin}\" hook {event_cmd}")
+    } else {
+        format!("{bin} hook {event_cmd}")
+    }
+}
+
+/// Is this settings.json command one of ours for `event_cmd`?
+///
+/// Matched by suffix so a reinstall under a different prefix still recognizes —
+/// and replaces — the old entry. It deliberately does not match a command that
+/// merely *contains* ours (`cenv hook stop && notify-me`): that is the user's
+/// own wrapper, and removing it would silently discard their customization.
+fn is_our_command(command: &str, event_cmd: &str) -> bool {
+    let c = command.trim().trim_end_matches('"');
+    let tail = format!("hook {event_cmd}");
+    let Some(prefix) = c.strip_suffix(&tail) else {
+        return false;
+    };
+    let prefix = prefix.trim_end().trim_end_matches('"');
+    prefix.ends_with("cenv") || prefix.ends_with("cenv.exe")
+}
 
 fn hooks_value() -> Value {
     let mut hooks = serde_json::Map::new();
-    for (event, cmd) in HOOK_EVENTS {
+    for (event, event_cmd) in HOOK_EVENTS {
         hooks.insert(
             event.to_string(),
-            json!([{ "hooks": [{ "type": "command", "command": cmd }] }]),
+            json!([{ "hooks": [{ "type": "command", "command": hook_command(event_cmd) }] }]),
         );
     }
     Value::Object(hooks)
@@ -103,7 +142,7 @@ pub fn enable_hooks(remove: bool) -> Result<()> {
         bail!("settings.json \"hooks\" is not an object");
     }
 
-    for (event, cmd) in HOOK_EVENTS {
+    for (event, event_cmd) in HOOK_EVENTS {
         let groups = hooks
             .as_object_mut()
             .unwrap()
@@ -113,15 +152,15 @@ pub fn enable_hooks(remove: bool) -> Result<()> {
             bail!("hooks.{event} is not an array")
         };
 
-        // Remove only commands cenv itself wrote. Matching on a substring would
-        // also delete a user's own wrapper around the same command — e.g.
-        // `cenv hook stop && notify-me` — silently losing their customization.
+        // Drop our previous entries (under any install prefix) before adding
+        // the current one, so re-running stays idempotent and repairs a stale
+        // path instead of stacking a second hook next to it.
         for g in arr.iter_mut() {
             if let Some(inner) = g.get_mut("hooks").and_then(Value::as_array_mut) {
                 inner.retain(|h| {
                     !h.get("command")
                         .and_then(Value::as_str)
-                        .is_some_and(|c| c.trim() == cmd)
+                        .is_some_and(|c| is_our_command(c, event_cmd))
                 });
             }
         }
@@ -132,7 +171,9 @@ pub fn enable_hooks(remove: bool) -> Result<()> {
         });
 
         if !remove {
-            arr.push(json!({ "hooks": [{ "type": "command", "command": cmd }] }));
+            arr.push(json!({
+                "hooks": [{ "type": "command", "command": hook_command(event_cmd) }]
+            }));
         }
     }
 
@@ -393,4 +434,42 @@ fn restore_previous(path: &Path) -> Result<()> {
         println!("  restored:  {} <- {}", path.display(), latest.display());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hook_command_is_an_absolute_path() {
+        // Hooks run under a non-interactive shell with no profile sourced, so a
+        // bare `cenv` would fail with "command not found" on every stop.
+        let cmd = hook_command("stop");
+        assert!(cmd.ends_with(" hook stop"), "{cmd}");
+        let bin = cmd.trim_end_matches(" hook stop").trim_matches('"');
+        assert!(Path::new(bin).is_absolute(), "must be absolute: {cmd}");
+    }
+
+    #[test]
+    fn recognizes_our_commands_across_prefixes() {
+        // Ours, under any install prefix — must be replaced on re-run.
+        for c in [
+            "cenv hook stop",
+            "/Users/x/.cargo/bin/cenv hook stop",
+            "\"/Users/a b/.cargo/bin/cenv\" hook stop",
+            "  /usr/local/bin/cenv hook stop  ",
+        ] {
+            assert!(is_our_command(c, "stop"), "should match: {c}");
+        }
+        // Not ours — a wrapper or a different event must survive untouched.
+        for c in [
+            "cenv hook stop && notify-me",
+            "my-wrapper 'cenv hook stop'",
+            "/Users/x/.cargo/bin/cenv hook session-end",
+            "cenvious hook stop",
+            "python3 hooks/other.py",
+        ] {
+            assert!(!is_our_command(c, "stop"), "should NOT match: {c}");
+        }
+    }
 }
