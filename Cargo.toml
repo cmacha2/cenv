@@ -1,6 +1,6 @@
 [package]
 name = "cenv"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.85"
 description = "Single-binary Claude Code companion: incremental conversation capture to Markdown, one-call session summaries and CLAUDE.md rule distillation, and fail-closed config/memory sync"

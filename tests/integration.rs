@@ -27,6 +27,15 @@ impl Sandbox {
     }
 
     fn cenv(&self, args: &[&str], stdin: Option<&str>) -> (bool, String) {
+        self.cenv_env(args, stdin, &[])
+    }
+
+    fn cenv_env(
+        &self,
+        args: &[&str],
+        stdin: Option<&str>,
+        extra: &[(&str, String)],
+    ) -> (bool, String) {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_cenv"));
         cmd.args(args)
             .env("CENV_HOME", self.root.path())
@@ -39,6 +48,9 @@ impl Sandbox {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
         let mut child = cmd.spawn().unwrap();
         if let Some(s) = stdin {
             child.stdin.take().unwrap().write_all(s.as_bytes()).unwrap();
@@ -389,6 +401,113 @@ fn same_named_projects_get_separate_stores() {
         2,
         "two projects named api must not share a store: {stores:?}"
     );
+}
+
+/// The regression this pins: SessionEnd used to run the model call inline, and
+/// the host cancels that hook while it's in flight — so the summary was written
+/// only when the hook happened to win the race against teardown. The analysis
+/// must now outlive the hook.
+///
+/// A stub `claude` that deliberately takes its time separates the two designs:
+/// inline, the hook cannot return before the stub does; detached, it returns
+/// immediately and the summary lands afterwards.
+#[test]
+fn session_end_does_not_block_on_the_model_call() {
+    use std::time::{Duration, Instant};
+
+    let sb = Sandbox::new();
+    let bin = sb.path("stubbin");
+    fs::create_dir_all(&bin).unwrap();
+    let stub = bin.join("claude");
+    fs::write(
+        &stub,
+        "#!/bin/sh\ncat > /dev/null\nsleep 3\nprintf '%s\\n' '{\"summary\":\"stub summary\",\"rules\":[]}'\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fs::create_dir_all(sb.path("config")).unwrap();
+    fs::write(
+        sb.path("config/config.toml"),
+        "[llm]\nmin_exchanges = 1\nmin_chars = 1\ntimeout_secs = 30\n",
+    )
+    .unwrap();
+
+    let tdir = sb.path("claude/projects/-work-demo-app");
+    fs::create_dir_all(&tdir).unwrap();
+    let transcript = tdir.join("s.jsonl");
+    write_transcript(
+        &transcript,
+        &[
+            line(
+                "user",
+                r#""promptSource":"terminal","message":{"role":"user","content":"explica el operador ? de Rust"}"#,
+            ),
+            line(
+                "assistant",
+                r#""message":{"role":"assistant","content":[{"type":"text","text":"Propaga el error hacia arriba."}]}"#,
+            ),
+        ],
+    );
+    let hook_json = format!(
+        r#"{{"session_id":"itest-session-0001","transcript_path":"{}","cwd":"/work/demo-app"}}"#,
+        transcript.display()
+    );
+    let path_env = (
+        "PATH",
+        format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    );
+
+    let started = Instant::now();
+    let (ok, out) = sb.cenv_env(&["hook", "session-end"], Some(&hook_json), &[path_env]);
+    let elapsed = started.elapsed();
+    assert!(ok, "{out}");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "session-end must hand the model call off, not wait {elapsed:?} for it"
+    );
+
+    // …and the handed-off work must actually complete, after the hook is gone.
+    let sidecar_dir = sb.path("data/history/demo-app/.summaries");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut found = None;
+    while Instant::now() < deadline {
+        if let Ok(entries) = fs::read_dir(&sidecar_dir) {
+            if let Some(p) = entries
+                .flatten()
+                .map(|e| e.path())
+                .find(|p| p.extension().is_some_and(|x| x == "md"))
+            {
+                found = Some(p);
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let sidecar = found.expect("the detached worker never wrote a summary");
+    assert!(
+        fs::read_to_string(&sidecar)
+            .unwrap()
+            .contains("stub summary"),
+        "summary content should come from the model call"
+    );
+
+    // The claim must be released, or the session would look permanently taken.
+    let leftover: Vec<_> = fs::read_dir(sb.path("state/sessions"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".claim"))
+        .collect();
+    assert!(leftover.is_empty(), "stale claim left behind: {leftover:?}");
 }
 
 #[test]

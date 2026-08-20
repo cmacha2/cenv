@@ -55,7 +55,7 @@ then `claude login` (credentials never sync, by design).
 | `cenv doctor [--quiet]` | Verify capture wiring; `--quiet` prints only problems (runs at every session start) |
 | `cenv export [FILE...]` | Export the current project's sessions (or specific `.jsonl` files) to Markdown |
 | `cenv export --reindex` | Rebuild the project index from export frontmatter |
-| `cenv analyze [--all] [--limit N]` | Summarize and distill sessions whose SessionEnd hook never finished |
+| `cenv analyze [--all] [--limit N]` | Run the summary + distillation pass for any session still pending |
 | `cenv adopt [--central]` | Keep this project's history in `<project>/history/` instead of the central store |
 | `cenv distill apply [--path DIR] [--global --confirm]` | Apply checked `[x]` rule candidates into the matching CLAUDE.md |
 | `cenv distill scan-global` | Cluster candidates across projects; recurring ones become global candidates |
@@ -124,11 +124,15 @@ staging — and fixing what a code review of it surfaced:
   `enable-hooks` writes the resolved path of the binary you ran, re-running
   repairs a stale path in place, and `doctor` reports a hook command the hook
   shell could not resolve.
-- **The summary survives a cancelled hook.** SessionEnd is the one hook that may
-  call a model, and the host can cancel it mid-call (headless runs do this every
-  time). The work is never lost: `cenv analyze` runs the pass for any session the
-  hook did not finish, and a new session mentions the backlog instead of blocking
-  on it.
+- **No slow work inside a hook.** SessionEnd is the one hook that may call a
+  model, and it fires while the host is tearing the session down — so the host
+  stops waiting and cancels it, and inline the summary only ever landed when the
+  hook happened to win that race. Raising the timeout doesn't fix a deadline that
+  isn't yours. So the hook doesn't do the work: it re-invokes cenv in its own
+  process group with no inherited stdio, returns in milliseconds, and the
+  analysis completes after the session is gone. If that worker is killed too, the
+  next session you start sweeps the backlog in the background, and `cenv analyze`
+  is there to run it by hand.
 
 ### Debugging
 

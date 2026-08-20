@@ -39,7 +39,12 @@ fn usable_transcript(input: &HookInput) -> Option<PathBuf> {
 /// narrates what a hook decided and why, on stderr, where Claude Code shows it.
 fn debug(msg: impl std::fmt::Display) {
     if std::env::var_os("CENV_DEBUG").is_some() {
-        eprintln!("cenv: {msg}");
+        let who = if crate::detach::is_worker() {
+            "cenv worker"
+        } else {
+            "cenv"
+        };
+        eprintln!("{who}: {msg}");
     }
 }
 
@@ -64,6 +69,12 @@ pub fn stop() {
     );
 }
 
+/// SessionEnd: finish the export, then hand the model call to a detached worker.
+///
+/// The export is fast and must happen here, while we still know the transcript
+/// path. The analysis is not fast, and this hook runs while the host is shutting
+/// the session down — doing it inline means racing teardown and usually losing,
+/// which is exactly the bug this shape removes.
 pub fn session_end() {
     if paths::locked() {
         return;
@@ -77,7 +88,19 @@ pub fn session_end() {
         "export",
         export::export_incremental(&transcript, &input.session_id),
     );
-    report("analysis", analyze_session(&transcript, &input.session_id));
+
+    let cfg = config::load();
+    match state::load_session(&input.session_id) {
+        Some(st) if analysis_pending(&st, &cfg) => {
+            if crate::detach::spawn_worker(&["analyze", "--session", &input.session_id]) {
+                debug("session-end: analysis handed to a detached worker");
+            } else {
+                debug("session-end: could not detach, analyzing inline (may be cancelled)");
+                report("analysis", analyze_session(&transcript, &input.session_id));
+            }
+        }
+        _ => debug("session-end: nothing to analyze"),
+    }
 }
 
 /// Does this session still deserve an analysis pass?
@@ -111,23 +134,42 @@ pub fn pending_analyses(cfg: &config::Config) -> Vec<(String, state::SessionStat
         .collect()
 }
 
-/// Run the analysis pass for sessions the SessionEnd hook never finished.
-pub fn analyze_pending(limit: usize, only_cwd: Option<&str>) -> anyhow::Result<()> {
+/// How long a claim stays valid before another worker may take the session over.
+/// Comfortably longer than a model call, short enough that a killed worker does
+/// not park a session indefinitely.
+const CLAIM_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Run the analysis pass. `only_session` narrows it to one id (what a detached
+/// worker does), `only_cwd` to one project; `quiet` suppresses the progress
+/// output for background runs.
+pub fn analyze_pending(
+    limit: usize,
+    only_cwd: Option<&str>,
+    only_session: Option<&str>,
+    quiet: bool,
+) -> anyhow::Result<()> {
     let cfg = config::load();
     let pending: Vec<_> = pending_analyses(&cfg)
         .into_iter()
-        .filter(|(_, st)| match only_cwd {
-            Some(cwd) => st.meta.cwd.as_deref() == Some(cwd),
-            None => true,
+        .filter(|(sid, st)| match only_session {
+            Some(want) => sid == want,
+            None => match only_cwd {
+                Some(cwd) => st.meta.cwd.as_deref() == Some(cwd),
+                None => true,
+            },
         })
         .take(limit)
         .collect();
 
+    macro_rules! say {
+        ($($arg:tt)*) => { if !quiet { println!($($arg)*); } };
+    }
+
     if pending.is_empty() {
-        println!("Nothing pending — every captured session has been analyzed.");
+        say!("Nothing pending — every captured session has been analyzed.");
         return Ok(());
     }
-    println!(
+    say!(
         "Analyzing {} session(s) with `claude -p` (model={})…",
         pending.len(),
         cfg.llm.model
@@ -135,20 +177,28 @@ pub fn analyze_pending(limit: usize, only_cwd: Option<&str>) -> anyhow::Result<(
     let mut done = 0;
     for (sid, st) in &pending {
         let title = crate::render::title_of(&st.meta);
-        match analyze_session(&st.transcript, sid) {
+        if !state::try_claim(sid, CLAIM_TTL) {
+            say!("  – {title} (another worker is on it)");
+            continue;
+        }
+        let outcome = analyze_session(&st.transcript, sid);
+        state::release_claim(sid);
+        match outcome {
             Ok(()) => {
-                let fresh = state::load_session(sid);
-                if fresh.and_then(|s| s.llm_done_mtime).is_some() {
+                if state::load_session(sid)
+                    .and_then(|s| s.llm_done_mtime)
+                    .is_some()
+                {
                     done += 1;
-                    println!("  ✓ {title}");
+                    say!("  ✓ {title}");
                 } else {
-                    println!("  – {title} (skipped: too trivial, or the model returned nothing)");
+                    say!("  – {title} (skipped: too trivial, or the model returned nothing)");
                 }
             }
-            Err(e) => println!("  ✗ {title}: {e:#}"),
+            Err(e) => say!("  ✗ {title}: {e:#}"),
         }
     }
-    println!("Analyzed {done} of {}.", pending.len());
+    say!("Analyzed {done} of {}.", pending.len());
     Ok(())
 }
 
@@ -263,10 +313,12 @@ pub fn session_start() {
         ));
     }
 
-    // Mention an analysis backlog, never work through it here: SessionStart must
-    // not block a session on model calls.
+    // Clear any backlog in the background. This is the second line of defence
+    // behind SessionEnd's detached worker: if that worker was killed before it
+    // finished, the next session you open picks the session up. Never inline —
+    // starting a session must not wait on a model call.
     let unanalyzed = pending_analyses(&config::load()).len();
-    if unanalyzed > 0 {
+    if unanalyzed > 0 && !crate::detach::spawn_worker(&["analyze", "--all", "--quiet"]) {
         system.push(format!(
             "cenv: {unanalyzed} session(s) awaiting a summary — run `cenv analyze` when convenient"
         ));

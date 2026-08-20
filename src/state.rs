@@ -39,6 +39,42 @@ pub fn save_session(session_id: &str, st: &SessionState) -> Result<()> {
     write_atomic(&path, &serde_json::to_vec_pretty(st)?)
 }
 
+fn claim_file(session_id: &str) -> PathBuf {
+    paths::state_dir()
+        .join("sessions")
+        .join(format!("{}.claim", paths::slugify(session_id, 64)))
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Take exclusive responsibility for analyzing a session, or report that
+/// somebody else already has it.
+///
+/// Two workers can legitimately race for the same session — one detached from
+/// the session that just ended, one from the next session's catch-up sweep — and
+/// paying for the same model call twice is the mild failure; interleaved writes
+/// to the same export are the real one. A claim goes stale after `ttl` so a
+/// worker that was killed mid-flight doesn't block the session forever.
+pub fn try_claim(session_id: &str, ttl: std::time::Duration) -> bool {
+    let path = claim_file(session_id);
+    if let Ok(raw) = fs::read_to_string(&path)
+        && let Ok(stamped) = raw.trim().parse::<u64>()
+        && now_secs().saturating_sub(stamped) < ttl.as_secs()
+    {
+        return false;
+    }
+    write_atomic(&path, now_secs().to_string().as_bytes()).is_ok()
+}
+
+pub fn release_claim(session_id: &str) {
+    let _ = fs::remove_file(claim_file(session_id));
+}
+
 /// Every tracked session, as (session id, state), newest transcript first.
 /// The id is recovered from the state itself so a slugified filename can never
 /// desynchronize from it.

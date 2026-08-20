@@ -1,5 +1,6 @@
 mod backfill;
 mod config;
+mod detach;
 mod distill;
 mod doctor;
 mod export;
@@ -78,6 +79,12 @@ enum Cmd {
         /// Stop after this many sessions
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Only this session id (used by the detached worker a hook spawns)
+        #[arg(long)]
+        session: Option<String>,
+        /// Print nothing — for background runs
+        #[arg(long)]
+        quiet: bool,
     },
     /// Keep this project's history inside the repo (<project>/history/) instead of the central store
     Adopt {
@@ -195,11 +202,21 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Analyze { all, limit } => {
+        Cmd::Analyze {
+            all,
+            limit,
+            session,
+            quiet,
+        } => {
             let cwd = std::env::current_dir()
                 .ok()
                 .map(|p| p.to_string_lossy().into_owned());
-            hook::analyze_pending(limit, if all { None } else { cwd.as_deref() })?;
+            let scope = if all || session.is_some() {
+                None
+            } else {
+                cwd.as_deref()
+            };
+            hook::analyze_pending(limit, scope, session.as_deref(), quiet)?;
         }
         Cmd::Adopt { central } => {
             let cwd = std::env::current_dir()?;
