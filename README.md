@@ -56,6 +56,7 @@ then `claude login` (credentials never sync, by design).
 | `cenv export [FILE...]` | Export the current project's sessions (or specific `.jsonl` files) to Markdown |
 | `cenv export --reindex` | Rebuild the project index from export frontmatter |
 | `cenv analyze [--all] [--limit N]` | Run the summary + distillation pass for any session still pending |
+| `cenv reorganize [--all] [--apply]` | Move existing exports into the configured layout (dry-run by default) |
 | `cenv adopt [--central]` | Keep this project's history in `<project>/history/` instead of the central store |
 | `cenv distill apply [--path DIR] [--global --confirm]` | Apply checked `[x]` rule candidates into the matching CLAUDE.md |
 | `cenv distill scan-global` | Cluster candidates across projects; recurring ones become global candidates |
@@ -63,11 +64,17 @@ then `claude login` (credentials never sync, by design).
 | `cenv backfill [--export] [--analyze]` | Export ALL existing transcripts into a browsable archive (dry-run by default) |
 | `cenv init` / `install` / `uninstall` | Env-repo scaffolding and symlink management |
 
+Upgrading from 0.1.2 or earlier: exports used to sit directly in the store
+root, and now land in `sessions/<YYYY-MM>/`. Both layouts are read correctly, so
+nothing breaks in the meantime and `cenv doctor` tells you what's left —
+`cenv reorganize --all --apply` moves the old ones over (dry-run without
+`--apply`). Prefer the old shape? `layout = "flat"` in `config.toml` keeps it.
+
 ## Where things live
 
 | Path | Contents |
 |---|---|
-| `~/.local/share/cenv/history/<project>/` | Markdown exports + `INDEX.md` + rule-candidate staging |
+| `~/.local/share/cenv/history/<project>/` | `INDEX.md` + rule-candidate staging, with the exports themselves under `sessions/<YYYY-MM>/` |
 | `~/.local/state/cenv/sessions/` | Per-session incremental state (byte offsets, cached metadata) |
 | `~/.claude-env/` | Your private env repo (optional) |
 | `~/.local/share/cenv/archive/` | Backfill output |
@@ -143,6 +150,16 @@ problems. `CENV_DEBUG=1` makes them narrate what they decided and why:
 CENV_DEBUG=1 claude    # hook decisions appear on stderr
 cenv doctor            # or check the wiring directly
 ```
+- **A store stays browsable as it grows.** Exports live in
+  `sessions/<YYYY-MM>/`, so the store root holds only what you actually open by
+  hand — the index and the rule candidates — instead of a flat pile that reaches
+  a few hundred files inside a year. Index rows carry the store-relative path,
+  the `__<sid8>` lookup searches the whole store, and both layouts are read
+  correctly at any time, so a store part-migrated (or deliberately `flat`) is
+  never a broken one. `cenv reorganize` moves what's already on disk: it never
+  rewrites a filename, refuses to overwrite an occupied destination, rebuilds
+  the index so its links follow, and repoints per-session state so the next Stop
+  hook still appends instead of re-rendering the whole transcript.
 - **Your own config survives.** `enable-hooks` merges into `settings.json`
   instead of replacing it, backs it up first, writes atomically, removes only
   the exact commands cenv itself wrote, and — if `install` ever displaces a
@@ -155,6 +172,7 @@ cenv doctor            # or check the wiring directly
 ```toml
 [capture]
 detail = "conversation"   # conversation | tools | full
+layout = "month"          # month (sessions/<YYYY-MM>/) | flat (next to INDEX.md)
 
 [llm]
 model = "haiku"           # model for summaries/distillation

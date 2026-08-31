@@ -67,6 +67,28 @@ impl Sandbox {
     }
 }
 
+/// Every export in a store, at whatever depth the layout nests it.
+fn exports_in(store: &Path) -> Vec<std::path::PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "md") && name != "INDEX.md" {
+                out.push(p);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(store, &mut out);
+    out.sort();
+    out
+}
+
 fn line(kind: &str, extra: &str) -> String {
     format!(
         r#"{{"type":"{kind}","sessionId":"itest-session-0001","cwd":"/work/demo-app","timestamp":"2026-08-19T10:00:00Z",{extra}}}"#
@@ -107,14 +129,14 @@ fn hook_capture_is_incremental_and_scoped() {
     assert!(ok);
 
     let store = sb.path("data/history/demo-app");
-    let exports: Vec<_> = fs::read_dir(&store)
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "md"))
-        .filter(|p| p.file_name().is_some_and(|n| n != "INDEX.md"))
-        .collect();
+    let exports = exports_in(&store);
     assert_eq!(exports.len(), 1, "one export for one session");
+    assert_eq!(
+        exports[0].parent().and_then(|p| p.parent()),
+        Some(store.join("sessions").as_path()),
+        "exports are bucketed under sessions/<YYYY-MM>/: {}",
+        exports[0].display()
+    );
     let md = fs::read_to_string(&exports[0]).unwrap();
     assert!(md.contains("arregla el bug de login"));
     assert!(md.contains("Voy a mirarlo."));
@@ -306,12 +328,8 @@ fn manual_export_of_a_live_transcript_does_not_lose_the_next_turn() {
     assert!(ok);
 
     let store = sb.path("data/history/demo-app");
-    let md = fs::read_dir(&store)
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "md"))
-        .filter(|p| p.file_name().is_some_and(|n| n != "INDEX.md"))
+    let md = exports_in(&store)
+        .into_iter()
         .map(|p| fs::read_to_string(p).unwrap())
         .collect::<String>();
     assert!(
@@ -340,15 +358,7 @@ fn deleting_the_export_rebuilds_it_in_full() {
     sb.cenv(&["hook", "stop"], Some(&hook_json));
 
     let store = sb.path("data/history/demo-app");
-    let export = fs::read_dir(&store)
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .find(|p| {
-            p.extension().is_some_and(|e| e == "md")
-                && p.file_name().is_some_and(|n| n != "INDEX.md")
-        })
-        .unwrap();
+    let export = exports_in(&store).into_iter().next().unwrap();
 
     // User deletes the markdown, then the session continues.
     fs::remove_file(&export).unwrap();
@@ -613,4 +623,87 @@ fn enable_hooks_replaces_a_stale_binary_path() {
         2,
         "exactly our new entry plus the user's wrapper:\n{content}"
     );
+}
+
+#[test]
+fn reorganize_moves_flat_exports_and_keeps_capture_incremental() {
+    let sb = Sandbox::new();
+    // Capture one session under the old flat layout.
+    fs::write(
+        sb.path("config/config.toml"),
+        "[capture]\nlayout = \"flat\"\n",
+    )
+    .unwrap();
+    let tdir = sb.path("claude/projects/-work-demo-app");
+    fs::create_dir_all(&tdir).unwrap();
+    let transcript = tdir.join("s.jsonl");
+    write_transcript(
+        &transcript,
+        &[line(
+            "user",
+            r#""promptSource":"terminal","message":{"role":"user","content":"turno uno"}"#,
+        )],
+    );
+    let hook_json = format!(
+        r#"{{"session_id":"itest-session-0001","transcript_path":"{}","cwd":"/work/demo-app"}}"#,
+        transcript.display()
+    );
+    sb.cenv(&["hook", "stop"], Some(&hook_json));
+
+    let store = sb.path("data/history/demo-app");
+    let flat = exports_in(&store);
+    assert_eq!(flat.len(), 1);
+    assert_eq!(
+        flat[0].parent(),
+        Some(store.as_path()),
+        "flat to begin with"
+    );
+
+    // Back to the default layout; a dry run reports without touching anything.
+    fs::remove_file(sb.path("config/config.toml")).unwrap();
+    let store_arg = store.to_string_lossy().into_owned();
+    let (ok, out) = sb.cenv(&["reorganize", "--store", &store_arg], None);
+    assert!(ok, "{out}");
+    assert!(out.contains("DRY RUN"), "{out}");
+    assert_eq!(exports_in(&store), flat, "dry run moved a file");
+
+    let (ok, out) = sb.cenv(&["reorganize", "--store", &store_arg, "--apply"], None);
+    assert!(ok, "{out}");
+    let moved = exports_in(&store);
+    assert_eq!(moved.len(), 1);
+    assert_eq!(
+        moved[0].parent(),
+        Some(store.join("sessions/2026-08").as_path()),
+        "bucketed by month: {}",
+        moved[0].display()
+    );
+    assert_eq!(
+        moved[0].file_name(),
+        flat[0].file_name(),
+        "the filename itself is never rewritten"
+    );
+
+    let index = fs::read_to_string(store.join("INDEX.md")).unwrap();
+    assert!(
+        index.contains("(sessions/2026-08/"),
+        "index links follow the move:\n{index}"
+    );
+
+    // The session continues: state must point at the moved file, or this
+    // re-renders from scratch and orphans a second export.
+    let mut all = fs::read_to_string(&transcript).unwrap();
+    all.push_str(&line(
+        "user",
+        r#""promptSource":"terminal","message":{"role":"user","content":"turno dos"}"#,
+    ));
+    all.push('\n');
+    fs::write(&transcript, all).unwrap();
+    let (ok, _) = sb.cenv(&["hook", "stop"], Some(&hook_json));
+    assert!(ok);
+
+    let after = exports_in(&store);
+    assert_eq!(after, moved, "no orphan export, same path reused");
+    let md = fs::read_to_string(&after[0]).unwrap();
+    assert!(md.contains("turno uno"), "{md}");
+    assert!(md.contains("turno dos"), "{md}");
 }

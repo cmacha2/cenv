@@ -101,6 +101,21 @@ enum Cmd {
         #[arg(long)]
         full_scan: bool,
     },
+    /// Move existing exports into the configured layout (dry-run by default)
+    Reorganize {
+        /// Actually move the files
+        #[arg(long)]
+        apply: bool,
+        /// Every project in the history store, not just this one
+        #[arg(long)]
+        all: bool,
+        /// A specific history dir (default: this project's store)
+        #[arg(long, conflicts_with = "all")]
+        store: Option<PathBuf>,
+        /// Override the configured layout for this run
+        #[arg(long, value_parser = ["month", "flat"])]
+        layout: Option<String>,
+    },
     /// Export ALL existing transcripts into a browsable archive (dry-run by default)
     Backfill {
         /// Actually write the archive
@@ -278,6 +293,52 @@ fn main() -> Result<()> {
                 distill::scan_global(&distill::all_store_dirs(&config::load_local()))?
             }
         },
+        Cmd::Reorganize {
+            apply,
+            all,
+            store,
+            layout,
+        } => {
+            let cfg = config::load();
+            let layout = layout.unwrap_or(cfg.capture.layout);
+            let stores = match (all, store) {
+                (true, _) => distill::all_store_dirs(&config::load_local()),
+                (_, Some(s)) => vec![s],
+                _ => vec![current_cwd_store()],
+            };
+            let mut total = 0;
+            for store in &stores {
+                if !store.is_dir() {
+                    continue;
+                }
+                let plan = export::reorganize(store, &layout, apply)?;
+                for c in &plan.conflicts {
+                    println!(
+                        "  skip {} — destination already taken",
+                        c.strip_prefix(store).unwrap_or(c).display()
+                    );
+                }
+                if plan.moves.is_empty() {
+                    continue;
+                }
+                total += plan.moves.len();
+                println!("{} ({} export(s))", store.display(), plan.moves.len());
+                for m in &plan.moves {
+                    println!(
+                        "  {} → {}",
+                        m.from.file_name().unwrap_or_default().to_string_lossy(),
+                        m.to.strip_prefix(store).unwrap_or(&m.to).display()
+                    );
+                }
+            }
+            if total == 0 {
+                println!("Nothing to move — every export already matches the `{layout}` layout.");
+            } else if apply {
+                println!("\nMoved {total} export(s); indexes rebuilt.");
+            } else {
+                println!("\nDRY RUN — nothing moved. Re-run with --apply.");
+            }
+        }
         Cmd::Sync { full_scan } => sync::run(full_scan)?,
         Cmd::Backfill {
             export,

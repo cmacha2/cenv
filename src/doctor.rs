@@ -154,6 +154,19 @@ fn advisories() -> Vec<String> {
     if !on_path("gitleaks") {
         out.push("`gitleaks` not on PATH — `cenv sync` will refuse to push (fail-closed)".into());
     }
+    let cfg = crate::config::load();
+    let stray: usize = crate::distill::all_store_dirs(&crate::config::load_local())
+        .iter()
+        .filter_map(|s| crate::export::reorganize(s, &cfg.capture.layout, false).ok())
+        .map(|p| p.moves.len())
+        .sum();
+    if stray > 0 {
+        out.push(format!(
+            "{stray} export(s) sit outside the `{}` layout — `cenv reorganize --all --apply` tidies them",
+            cfg.capture.layout
+        ));
+    }
+
     let repo = paths::env_repo();
     if repo.exists() {
         if paths::suspicious_temp(&fs::canonicalize(&repo).unwrap_or_else(|_| repo.clone())) {
@@ -173,14 +186,16 @@ fn advisories() -> Vec<String> {
 
 pub fn run(quiet: bool) -> i32 {
     let problems = problems();
-    let advisories = advisories();
 
+    // Advisories are never printed in quiet mode, and gathering them walks
+    // every history store — work the SessionStart hook has no reason to pay for.
     if quiet {
         for p in &problems {
             println!("⚠️  cenv doctor: {p}");
         }
         return if problems.is_empty() { 0 } else { 1 };
     }
+    let advisories = advisories();
 
     let settings = paths::claude_dir().join("settings.json");
     if problems.is_empty() {

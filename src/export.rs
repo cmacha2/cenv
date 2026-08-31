@@ -50,16 +50,91 @@ fn filename_for(meta: &Meta, sid: &str) -> String {
     format!("{date}_{project}_{title}__{sid8}.md")
 }
 
+/// Where an export goes *relative to its store root* — the month layout nests
+/// it under `sessions/<YYYY-MM>/`, keeping the store root free of the hundreds
+/// of files a year of sessions produces.
+fn relpath_for(meta: &Meta, sid: &str, layout: &str) -> PathBuf {
+    let name = filename_for(meta, sid);
+    if layout == config::LAYOUT_FLAT {
+        return PathBuf::from(name);
+    }
+    Path::new(paths::SESSIONS_DIR)
+        .join(paths::month_bucket(&render::date_of(
+            meta.started.as_deref(),
+        )))
+        .join(name)
+}
+
+/// The store root an export path belongs to, for either layout: a bucketed
+/// export sits two levels down (`<store>/sessions/<bucket>/x.md`), a flat one
+/// directly in the root. Derived from the path itself rather than recomputed
+/// from config, so it stays right for exports written under the other layout.
+pub fn store_root_of(out_path: &Path) -> PathBuf {
+    let parent = out_path.parent().unwrap_or(Path::new("."));
+    if parent
+        .parent()
+        .and_then(|p| p.file_name())
+        .is_some_and(|n| n == paths::SESSIONS_DIR)
+        && let Some(root) = parent.parent().and_then(|p| p.parent())
+    {
+        return root.to_path_buf();
+    }
+    parent.to_path_buf()
+}
+
+/// Store-relative path with `/` separators — what an INDEX.md link needs, and
+/// the identity of a row in the index cache.
+fn rel_str(store: &Path, p: &Path) -> String {
+    p.strip_prefix(store)
+        .unwrap_or(p)
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Every export under a store, at whatever depth the layout put it. Dot-dirs
+/// (`.index`, `.summaries`) and the store's own generated files are skipped,
+/// and symlinks are never followed — a linked directory could otherwise walk
+/// out of the store or into itself.
+pub fn walk_exports(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_symlink() {
+            continue;
+        }
+        let p = e.path();
+        if ft.is_dir() {
+            walk_exports(&p, out);
+            continue;
+        }
+        if p.extension().and_then(|x| x.to_str()) != Some("md")
+            || name == "INDEX.md"
+            || name == crate::distill::STAGING_NAME
+        {
+            continue;
+        }
+        out.push(p);
+    }
+}
+
 /// An export already on disk for this session id, found by the `__<sid8>.md`
-/// suffix every filename carries.
+/// suffix every filename carries. Searches the whole store: the file may have
+/// been written under a different layout than the one now configured.
 fn existing_export_for(out_dir: &Path, sid: &str) -> Option<PathBuf> {
     let suffix = format!("__{}.md", sid.chars().take(8).collect::<String>());
-    fs::read_dir(out_dir).ok()?.flatten().find_map(|e| {
-        let p = e.path();
-        p.file_name()?
-            .to_string_lossy()
-            .ends_with(&suffix)
-            .then_some(p)
+    let mut found = Vec::new();
+    walk_exports(out_dir, &mut found);
+    found.into_iter().find(|p| {
+        p.file_name()
+            .is_some_and(|n| n.to_string_lossy().ends_with(&suffix))
     })
 }
 
@@ -92,7 +167,7 @@ fn refresh_index(out_dir: &Path, meta: &Meta, out_path: &Path, prose: &str) -> R
         .map(String::from)
         .unwrap_or_else(|| render::trim_to(&meta.first_user, 110));
     let row = IndexRow {
-        file: out_path.file_name().unwrap().to_string_lossy().into_owned(),
+        file: rel_str(out_dir, out_path),
         started: render::fmt_time(meta.started.as_deref()),
         title: render::title_of(meta),
         summary,
@@ -161,8 +236,9 @@ pub fn export_incremental(transcript: &Path, session_id: &str) -> Result<Option<
     fs::create_dir_all(&out_dir)?;
 
     if st.out_path.as_os_str().is_empty() {
-        st.out_path = existing_export_for(&out_dir, session_id)
-            .unwrap_or_else(|| out_dir.join(filename_for(&st.meta, session_id)));
+        st.out_path = existing_export_for(&out_dir, session_id).unwrap_or_else(|| {
+            out_dir.join(relpath_for(&st.meta, session_id, &cfg.capture.layout))
+        });
     }
 
     let prose = read_sidecar(&out_dir, Some(session_id));
@@ -229,14 +305,15 @@ pub fn export_full(transcript: &Path, archive_dir: Option<&Path>) -> Result<Opti
     // Archive mode names purely from content, which is already stable across
     // re-runs, and stays strictly one file per transcript: reusing a name by
     // session id could make two transcripts overwrite each other.
+    let relpath = relpath_for(&meta, &sid, &cfg.capture.layout);
     let out_path = if archive_dir.is_none() {
         state::load_session(&sid)
             .filter(|s| !s.out_path.as_os_str().is_empty())
             .map(|s| s.out_path)
             .or_else(|| existing_export_for(&out_dir, &sid))
-            .unwrap_or_else(|| out_dir.join(filename_for(&meta, &sid)))
+            .unwrap_or_else(|| out_dir.join(&relpath))
     } else {
-        out_dir.join(filename_for(&meta, &sid))
+        out_dir.join(&relpath)
     };
 
     let prose = read_sidecar(&out_dir, Some(&sid));
@@ -269,7 +346,7 @@ pub fn refresh_header(session_id: &str) -> Result<()> {
     if st.out_path.as_os_str().is_empty() || !st.out_path.exists() {
         return Ok(());
     }
-    let out_dir = st.out_path.parent().unwrap().to_path_buf();
+    let out_dir = store_root_of(&st.out_path);
     let prose = read_sidecar(&out_dir, Some(session_id));
     // No marker means no body boundary to preserve — leave the file alone
     // rather than rewriting it from a header plus nothing.
@@ -285,16 +362,10 @@ pub fn refresh_header(session_id: &str) -> Result<()> {
 pub fn reindex(store_dir: &Path) -> Result<usize> {
     let mut rows = Vec::new();
     let mut project = String::from("unknown");
-    for entry in fs::read_dir(store_dir)? {
-        let p = entry?.path();
-        let name = p
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-        if p.extension().and_then(|e| e.to_str()) != Some("md") || name == "INDEX.md" {
-            continue;
-        }
+    let mut exports = Vec::new();
+    walk_exports(store_dir, &mut exports);
+    for p in exports {
+        let name = rel_str(store_dir, &p);
         let Ok(content) = fs::read_to_string(&p) else {
             continue;
         };
@@ -326,6 +397,95 @@ pub fn reindex(store_dir: &Path) -> Result<usize> {
         render::index_markdown(&project, &cache.rows).as_bytes(),
     )?;
     Ok(n)
+}
+
+/// One export relocated by `reorganize`.
+pub struct Move {
+    pub from: PathBuf,
+    pub to: PathBuf,
+}
+
+#[derive(Default)]
+pub struct Plan {
+    pub moves: Vec<Move>,
+    /// Exports whose destination is already taken — reported, never overwritten.
+    pub conflicts: Vec<PathBuf>,
+}
+
+/// Bring a store's existing exports under the configured layout.
+///
+/// Filenames are never rewritten — only the directory they sit in — so links
+/// people already saved keep resolving to the same basename, and the `__<sid8>`
+/// lookup keeps working. The month comes from the filename's own date prefix,
+/// which is what named the file in the first place, so no file is read to place
+/// it. Reports the moves without touching anything unless `apply`.
+pub fn reorganize(store_dir: &Path, layout: &str, apply: bool) -> Result<Plan> {
+    let mut exports = Vec::new();
+    walk_exports(store_dir, &mut exports);
+    exports.sort();
+
+    let mut plan = Plan::default();
+    for from in exports {
+        let name = from
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let want = if layout == config::LAYOUT_FLAT {
+            PathBuf::from(&name)
+        } else {
+            Path::new(paths::SESSIONS_DIR)
+                .join(paths::month_bucket(&name))
+                .join(&name)
+        };
+        let to = store_dir.join(&want);
+        if to == from {
+            continue;
+        }
+        if to.exists() {
+            plan.conflicts.push(from);
+            continue;
+        }
+        plan.moves.push(Move { from, to });
+    }
+    if !apply || plan.moves.is_empty() {
+        return Ok(plan);
+    }
+
+    for m in &plan.moves {
+        fs::create_dir_all(m.to.parent().unwrap_or(store_dir))?;
+        fs::rename(&m.from, &m.to).with_context(|| format!("moving {}", m.from.display()))?;
+    }
+    // Empty month buckets (or the store root) left behind by a layout flip.
+    prune_empty_dirs(store_dir);
+    // Row keys are derived from the store-relative path, so every row moved.
+    reindex(store_dir)?;
+    repoint_state(&plan.moves)?;
+    Ok(plan)
+}
+
+/// A session's recorded `out_path` must follow its export, or the next Stop
+/// hook finds nothing to append to and re-renders the whole transcript.
+fn repoint_state(moves: &[Move]) -> Result<()> {
+    for (sid, mut st) in state::all_sessions() {
+        if let Some(m) = moves.iter().find(|m| m.from == st.out_path) {
+            st.out_path = m.to.clone();
+            state::save_session(&sid, &st)?;
+        }
+    }
+    Ok(())
+}
+
+fn prune_empty_dirs(store_dir: &Path) {
+    let sessions = store_dir.join(paths::SESSIONS_DIR);
+    if let Ok(rd) = fs::read_dir(&sessions) {
+        for e in rd.flatten() {
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                let _ = fs::remove_dir(e.path()); // only succeeds when empty
+            }
+        }
+    }
+    let _ = fs::remove_dir(&sessions);
 }
 
 pub fn parse_frontmatter(content: &str) -> serde_json::Map<String, serde_json::Value> {

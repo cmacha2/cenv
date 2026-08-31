@@ -23,15 +23,22 @@ pub struct Config {
 pub struct Capture {
     /// "conversation" | "tools" | "full"
     pub detail: String,
+    /// Where exports land inside a store: "month" nests them under
+    /// `sessions/<YYYY-MM>/`, "flat" drops them next to INDEX.md.
+    pub layout: String,
 }
 
 impl Default for Capture {
     fn default() -> Self {
         Self {
             detail: "conversation".into(),
+            layout: LAYOUT_MONTH.into(),
         }
     }
 }
+
+pub const LAYOUT_MONTH: &str = "month";
+pub const LAYOUT_FLAT: &str = "flat";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]

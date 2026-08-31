@@ -78,6 +78,26 @@ pub fn suspicious_temp(p: &std::path::Path) -> bool {
     is_temp_path(&p) && !p.starts_with(canon(&home()))
 }
 
+/// Subdirectory holding a store's session exports, bucketed by month.
+/// The store root keeps only generated files: INDEX.md, the rule-candidate
+/// staging file, `.project`, `.index/`, `.summaries/`.
+pub const SESSIONS_DIR: &str = "sessions";
+
+/// `YYYY-MM` bucket for an export date, or `undated` for anything that isn't
+/// one — a transcript with no usable timestamp must still land somewhere.
+pub fn month_bucket(date: &str) -> String {
+    let ym: String = date.chars().take(7).collect();
+    let shaped = ym.len() == 7
+        && ym.bytes().enumerate().all(|(i, b)| {
+            if i == 4 {
+                b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        });
+    if shaped { ym } else { "undated".into() }
+}
+
 /// Slug for project directory names inside the history store.
 pub fn slugify(text: &str, maxlen: usize) -> String {
     let mut s = String::new();
@@ -127,6 +147,15 @@ mod tests {
         assert_eq!(slugify("Hello, World! 2024", 45), "hello-world-2024");
         assert_eq!(slugify("", 45), "session");
         assert_eq!(slugify("---", 45), "session");
+    }
+
+    #[test]
+    fn month_buckets() {
+        assert_eq!(month_bucket("2026-08-31"), "2026-08");
+        assert_eq!(month_bucket("2026-08"), "2026-08");
+        assert_eq!(month_bucket(""), "undated");
+        assert_eq!(month_bucket("undated"), "undated");
+        assert_eq!(month_bucket("202608-31"), "undated");
     }
 
     #[test]
